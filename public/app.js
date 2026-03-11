@@ -39,8 +39,6 @@ function calculateProjectedTotal(currentTotal, period, timeRemainingStr, pregame
 
 // --- UI ---
 
-let refreshTimer = null;
-let refreshIntervalMs = 30000;
 
 function formatTime(isoString) {
   if (!isoString) return '--';
@@ -150,9 +148,9 @@ function updateStatusBar(data) {
 
   const warning = document.getElementById('warning');
   if (data.budgetExhausted) {
-    warning.textContent = 'API budget exhausted — showing cached data. Auto-refresh paused.';
+    warning.textContent = 'API budget exhausted — showing cached data.';
     warning.classList.remove('hidden');
-    stopRefresh();
+    document.getElementById('refreshBtn').disabled = true;
   } else {
     warning.classList.add('hidden');
   }
@@ -175,19 +173,6 @@ async function fetchGames() {
   }
 }
 
-function startRefresh() {
-  stopRefresh();
-  fetchGames();
-  refreshTimer = setInterval(fetchGames, refreshIntervalMs);
-}
-
-function stopRefresh() {
-  if (refreshTimer) {
-    clearInterval(refreshTimer);
-    refreshTimer = null;
-  }
-}
-
 // --- Init ---
 
 document.getElementById('setBudget').addEventListener('click', async () => {
@@ -206,11 +191,9 @@ document.getElementById('setBudget').addEventListener('click', async () => {
   }
 });
 
-document.getElementById('refreshInterval').addEventListener('change', () => {
-  const val = parseInt(document.getElementById('refreshInterval').value, 10);
-  if (isNaN(val) || val < 10) return;
-  refreshIntervalMs = val * 1000;
-  startRefresh();
+document.getElementById('refreshBtn').addEventListener('click', () => {
+  fetchGames();
 });
 
-startRefresh();
+// Load data once on page load
+fetchGames();
