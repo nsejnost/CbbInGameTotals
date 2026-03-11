@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CBB In-Game Totals</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <h1>CBB In-Game Projected Totals</h1>
+    <div class="controls">
+      <div class="control-group">
+        <label for="maxBudget">Max API Requests:</label>
+        <input type="number" id="maxBudget" value="50" min="1" max="500">
+        <button id="setBudget">Set</button>
+      </div>
+      <div class="control-group">
+        <label for="refreshInterval">Refresh (sec):</label>
+        <input type="number" id="refreshInterval" value="30" min="10" max="300">
+      </div>
+    </div>
+  </header>
+
+  <div class="status-bar">
+    <span id="lastUpdated">Last updated: --</span>
+    <span id="apiUsage">API Requests: 0 / 50</span>
+    <span id="quotaRemaining">Odds API Quota: --</span>
+  </div>
+
+  <div id="warning" class="warning hidden"></div>
+  <div id="loading" class="loading">Loading games...</div>
+
+  <div class="table-container">
+    <table id="gamesTable">
+      <thead>
+        <tr>
+          <th>Start Time</th>
+          <th>Away Team</th>
+          <th>Home Team</th>
+          <th>Time Remaining</th>
+          <th>Current Score</th>
+          <th>Pregame Total</th>
+          <th>DK Live Total</th>
+          <th>FD Live Total</th>
+          <th>Projected Total</th>
+          <th>Proj - DK</th>
+          <th>Proj - FD</th>
+        </tr>
+      </thead>
+      <tbody id="gamesBody">
+      </tbody>
+    </table>
+  </div>
+
+  <div id="noGames" class="no-games hidden">No games available at this time.</div>
+
+  <script src="app.js"></script>
+</body>
+</html>
