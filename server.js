@@ -17,6 +17,10 @@ let maxApiBudget = 50;
 let apiQuotaRemaining = null;
 let apiQuotaUsed = null;
 
+// Persistent cache of pregame totals keyed by game ID
+// Stores the totals seen when a game was still "scheduled" (not started)
+const pregameTotalsCache = {};
+
 const CACHE_TTL_MS = 30000; // 30 seconds
 
 // --- Helpers ---
@@ -81,21 +85,26 @@ async function getCachedEspn() {
   }
 }
 
-// Normalize team names for matching between Odds API and ESPN
-function normalizeTeam(name) {
+// Word-overlap team name matching between Odds API and ESPN
+const NOISE_WORDS = new Set(['university', 'of', 'the', 'state', 'st', 'at']);
+
+function getSignificantWords(name) {
   return name
     .toLowerCase()
-    .replace(/state/g, 'st')
-    .replace(/university/g, '')
     .replace(/[^a-z0-9 ]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .split(/\s+/)
+    .filter(w => w.length > 0 && !NOISE_WORDS.has(w));
+}
+
+function teamsMatch(name1, name2) {
+  const words1 = getSignificantWords(name1);
+  const words2 = getSignificantWords(name2);
+  // Match if at least one significant word overlaps
+  return words1.some(w => words2.includes(w));
 }
 
 function findEspnGame(espnData, homeTeam, awayTeam) {
   if (!espnData || !espnData.events) return null;
-  const normHome = normalizeTeam(homeTeam);
-  const normAway = normalizeTeam(awayTeam);
 
   for (const event of espnData.events) {
     const competitors = event.competitions?.[0]?.competitors || [];
@@ -103,17 +112,25 @@ function findEspnGame(espnData, homeTeam, awayTeam) {
     const espnAway = competitors.find(c => c.homeAway === 'away');
     if (!espnHome || !espnAway) continue;
 
-    const eHome = normalizeTeam(espnHome.team?.displayName || espnHome.team?.name || '');
-    const eAway = normalizeTeam(espnAway.team?.displayName || espnAway.team?.name || '');
-    const eHomeShort = normalizeTeam(espnHome.team?.shortDisplayName || '');
-    const eAwayShort = normalizeTeam(espnAway.team?.shortDisplayName || '');
+    // Collect all ESPN name variants for each team
+    const espnHomeNames = [
+      espnHome.team?.displayName,
+      espnHome.team?.shortDisplayName,
+      espnHome.team?.name,
+      espnHome.team?.abbreviation,
+    ].filter(Boolean);
+    const espnAwayNames = [
+      espnAway.team?.displayName,
+      espnAway.team?.shortDisplayName,
+      espnAway.team?.name,
+      espnAway.team?.abbreviation,
+    ].filter(Boolean);
 
-    if (
-      (eHome.includes(normHome) || normHome.includes(eHome) || eHomeShort.includes(normHome) || normHome.includes(eHomeShort)) &&
-      (eAway.includes(normAway) || normAway.includes(eAway) || eAwayShort.includes(normAway) || normAway.includes(eAwayShort))
-    ) {
+    const homeMatches = espnHomeNames.some(n => teamsMatch(homeTeam, n));
+    const awayMatches = espnAwayNames.some(n => teamsMatch(awayTeam, n));
+
+    if (homeMatches && awayMatches) {
       const status = event.status || {};
-      const competition = event.competitions?.[0] || {};
       return {
         clock: status.displayClock || '',
         period: status.period || 0,
@@ -192,13 +209,9 @@ app.get('/api/games', async (req, res) => {
       const oddsEvent = oddsMap[scoreEvent.id];
       const bookmakers = oddsEvent?.bookmakers || [];
 
-      // Get totals from each bookmaker
+      // Get current totals from each bookmaker (these are live-adjusted for in-progress games)
       const dkTotal = getBookmakerTotal(bookmakers, 'draftkings');
       const fdTotal = getBookmakerTotal(bookmakers, 'fanduel');
-
-      // Pregame total: average of available bookmaker lines from odds data
-      // (odds endpoint returns current lines; for pregame we use these if game hasn't started)
-      const pregameTotal = dkTotal || fdTotal || null;
 
       // Current score
       const homeScore = scoreEvent.scores?.find(s => s.name === scoreEvent.home_team)?.score;
@@ -206,6 +219,21 @@ app.get('/api/games', async (req, res) => {
       const currentTotal = homeScore != null && awayScore != null
         ? parseInt(homeScore) + parseInt(awayScore)
         : null;
+
+      const isLive = !scoreEvent.completed && scoreEvent.scores && scoreEvent.scores.length > 0;
+      const isScheduled = !scoreEvent.completed && (!scoreEvent.scores || scoreEvent.scores.length === 0);
+
+      // Pregame totals: capture when game is still scheduled, use cached value once live
+      if (isScheduled && (dkTotal || fdTotal)) {
+        // Average the available bookmaker lines for pregame total
+        const totals = [dkTotal, fdTotal].filter(t => t !== null);
+        pregameTotalsCache[scoreEvent.id] = totals.reduce((a, b) => a + b, 0) / totals.length;
+      }
+      const pregameTotal = pregameTotalsCache[scoreEvent.id] || null;
+
+      // Live totals: only show for in-progress games (these are live-adjusted lines)
+      const dkLiveTotal = isLive ? dkTotal : null;
+      const fdLiveTotal = isLive ? fdTotal : null;
 
       // ESPN clock data
       const espnGame = findEspnGame(espn, scoreEvent.home_team, scoreEvent.away_team);
@@ -243,8 +271,8 @@ app.get('/api/games', async (req, res) => {
         awayScore: awayScore != null ? parseInt(awayScore) : null,
         currentTotal,
         pregameTotal,
-        dkLiveTotal: dkTotal,
-        fdLiveTotal: fdTotal,
+        dkLiveTotal,
+        fdLiveTotal,
         timeRemaining,
         period,
         gameStatus,
@@ -264,6 +292,45 @@ app.get('/api/games', async (req, res) => {
     console.error('Error fetching games:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+app.get('/api/debug', async (req, res) => {
+  const espn = await getCachedEspn();
+  const scores = cache.scores.data;
+
+  const espnTeams = (espn?.events || []).map(e => {
+    const comp = e.competitions?.[0]?.competitors || [];
+    const home = comp.find(c => c.homeAway === 'home');
+    const away = comp.find(c => c.homeAway === 'away');
+    return {
+      home: {
+        displayName: home?.team?.displayName,
+        shortDisplayName: home?.team?.shortDisplayName,
+        name: home?.team?.name,
+        abbreviation: home?.team?.abbreviation,
+      },
+      away: {
+        displayName: away?.team?.displayName,
+        shortDisplayName: away?.team?.shortDisplayName,
+        name: away?.team?.name,
+        abbreviation: away?.team?.abbreviation,
+      },
+      status: e.status?.type?.name,
+      clock: e.status?.displayClock,
+      period: e.status?.period,
+    };
+  });
+
+  const oddsApiTeams = (scores || []).map(s => ({
+    id: s.id,
+    home: s.home_team,
+    away: s.away_team,
+    hasScores: !!(s.scores && s.scores.length > 0),
+    completed: s.completed,
+    espnMatch: findEspnGame(espn, s.home_team, s.away_team) ? 'MATCHED' : 'NO MATCH',
+  }));
+
+  res.json({ espnTeams, oddsApiTeams, pregameTotalsCache });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
