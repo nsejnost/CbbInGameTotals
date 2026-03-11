@@ -192,3 +192,10 @@ tbody tr:nth-child(even):hover {
 .neutral {
   color: #aaa;
 }
+
+.error-text {
+  color: #ff9800;
+  font-size: 0.7rem;
+  font-style: italic;
+  white-space: nowrap;
+}
