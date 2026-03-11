@@ -17,8 +17,10 @@ let maxApiBudget = 50;
 let apiQuotaRemaining = null;
 let apiQuotaUsed = null;
 
-// Persistent cache of pregame totals keyed by game ID
-// Stores the totals seen when a game was still "scheduled" (not started)
+// Track ESPN fetch status for error reporting
+let espnStatus = { ok: false, error: null, eventCount: 0 };
+
+// Persistent cache of pregame totals keyed by game ID (from Odds API pre-match)
 const pregameTotalsCache = {};
 
 const CACHE_TTL_MS = 30000; // 30 seconds
@@ -73,71 +75,113 @@ async function getCachedEspn() {
   if (cache.espn.data && now - cache.espn.timestamp < CACHE_TTL_MS) {
     return cache.espn.data;
   }
-  try {
-    const url = 'https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard';
-    const res = await fetch(url);
-    if (!res.ok) return cache.espn.data;
-    const data = await res.json();
-    cache.espn = { data, timestamp: now };
-    return data;
-  } catch {
-    return cache.espn.data;
+
+  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const urls = [
+    `https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard?dates=${today}&limit=200`,
+    `https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard?limit=200`,
+  ];
+
+  for (const url of urls) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        espnStatus = { ok: false, error: `ESPN HTTP ${res.status}`, eventCount: 0 };
+        console.error(`ESPN API returned ${res.status}`);
+        continue;
+      }
+      const data = await res.json();
+      const eventCount = data.events?.length || 0;
+      console.log(`ESPN: fetched ${eventCount} events from ${url.includes('dates=') ? 'dated' : 'default'} endpoint`);
+
+      if (eventCount > 0) {
+        espnStatus = { ok: true, error: null, eventCount };
+        cache.espn = { data, timestamp: now };
+        return data;
+      }
+      espnStatus = { ok: false, error: 'ESPN returned 0 events', eventCount: 0 };
+    } catch (err) {
+      const errMsg = err.name === 'AbortError' ? 'ESPN timeout (5s)' : `ESPN: ${err.message}`;
+      espnStatus = { ok: false, error: errMsg, eventCount: 0 };
+      console.error(`ESPN fetch error: ${errMsg}`);
+    }
   }
+
+  return cache.espn.data;
 }
 
-// Word-overlap team name matching between Odds API and ESPN
-const NOISE_WORDS = new Set(['university', 'of', 'the', 'state', 'st', 'at']);
+// --- Team Name Matching ---
+
+const NOISE_WORDS = new Set(['university', 'of', 'the', 'state', 'st', 'at', 'a']);
 
 function getSignificantWords(name) {
   return name
     .toLowerCase()
     .replace(/[^a-z0-9 ]/g, '')
     .split(/\s+/)
-    .filter(w => w.length > 0 && !NOISE_WORDS.has(w));
+    .filter(w => w.length > 1 && !NOISE_WORDS.has(w));
 }
 
 function teamsMatch(name1, name2) {
   const words1 = getSignificantWords(name1);
   const words2 = getSignificantWords(name2);
-  // Match if at least one significant word overlaps
+  if (words1.length === 0 || words2.length === 0) return false;
   return words1.some(w => words2.includes(w));
 }
 
-function findEspnGame(espnData, homeTeam, awayTeam) {
-  if (!espnData || !espnData.events) return null;
+function buildEspnLookup(espnData) {
+  if (!espnData || !espnData.events) return [];
 
-  for (const event of espnData.events) {
+  return espnData.events.map(event => {
     const competitors = event.competitions?.[0]?.competitors || [];
     const espnHome = competitors.find(c => c.homeAway === 'home');
     const espnAway = competitors.find(c => c.homeAway === 'away');
-    if (!espnHome || !espnAway) continue;
+    if (!espnHome || !espnAway) return null;
 
-    // Collect all ESPN name variants for each team
-    const espnHomeNames = [
+    const homeNames = [
       espnHome.team?.displayName,
       espnHome.team?.shortDisplayName,
       espnHome.team?.name,
+      espnHome.team?.location,
       espnHome.team?.abbreviation,
     ].filter(Boolean);
-    const espnAwayNames = [
+    const awayNames = [
       espnAway.team?.displayName,
       espnAway.team?.shortDisplayName,
       espnAway.team?.name,
+      espnAway.team?.location,
       espnAway.team?.abbreviation,
     ].filter(Boolean);
 
-    const homeMatches = espnHomeNames.some(n => teamsMatch(homeTeam, n));
-    const awayMatches = espnAwayNames.some(n => teamsMatch(awayTeam, n));
-
-    if (homeMatches && awayMatches) {
-      const status = event.status || {};
-      return {
-        clock: status.displayClock || '',
-        period: status.period || 0,
-        statusType: status.type?.name || '',
-        statusDetail: status.type?.shortDetail || status.type?.detail || '',
-      };
+    const odds = event.competitions?.[0]?.odds;
+    let overUnder = null;
+    if (odds && odds.length > 0) {
+      overUnder = odds[0].overUnder || null;
     }
+
+    const status = event.status || {};
+
+    return {
+      homeNames,
+      awayNames,
+      overUnder,
+      clock: status.displayClock || null,
+      period: status.period || 0,
+      statusType: status.type?.name || '',
+      statusDetail: status.type?.shortDetail || status.type?.detail || '',
+    };
+  }).filter(Boolean);
+}
+
+function findEspnGame(espnLookup, homeTeam, awayTeam) {
+  for (const espnEvent of espnLookup) {
+    const homeMatches = espnEvent.homeNames.some(n => teamsMatch(homeTeam, n));
+    const awayMatches = espnEvent.awayNames.some(n => teamsMatch(awayTeam, n));
+    if (homeMatches && awayMatches) return espnEvent;
   }
   return null;
 }
@@ -183,7 +227,6 @@ app.get('/api/games', async (req, res) => {
 
     const budgetExhausted = apiRequestCount >= maxApiBudget;
 
-    // Fetch all data in parallel
     const [scores, odds, espn] = await Promise.all([
       getCachedScores(),
       getCachedOdds(),
@@ -198,22 +241,21 @@ app.get('/api/games', async (req, res) => {
       });
     }
 
-    // Build odds lookup by event id
+    const espnLookup = buildEspnLookup(espn);
+    const espnAvailable = espnLookup.length > 0;
+
     const oddsMap = {};
     for (const event of odds) {
       oddsMap[event.id] = event;
     }
 
-    // Merge scores + odds + ESPN clock
     const games = scores.map(scoreEvent => {
       const oddsEvent = oddsMap[scoreEvent.id];
       const bookmakers = oddsEvent?.bookmakers || [];
 
-      // Get current totals from each bookmaker (these are live-adjusted for in-progress games)
       const dkTotal = getBookmakerTotal(bookmakers, 'draftkings');
       const fdTotal = getBookmakerTotal(bookmakers, 'fanduel');
 
-      // Current score
       const homeScore = scoreEvent.scores?.find(s => s.name === scoreEvent.home_team)?.score;
       const awayScore = scoreEvent.scores?.find(s => s.name === scoreEvent.away_team)?.score;
       const currentTotal = homeScore != null && awayScore != null
@@ -223,33 +265,47 @@ app.get('/api/games', async (req, res) => {
       const isLive = !scoreEvent.completed && scoreEvent.scores && scoreEvent.scores.length > 0;
       const isScheduled = !scoreEvent.completed && (!scoreEvent.scores || scoreEvent.scores.length === 0);
 
-      // Pregame totals: capture when game is still scheduled, use cached value once live
+      // Cache Odds API pregame totals when games are still scheduled
       if (isScheduled && (dkTotal || fdTotal)) {
-        // Average the available bookmaker lines for pregame total
         const totals = [dkTotal, fdTotal].filter(t => t !== null);
         pregameTotalsCache[scoreEvent.id] = totals.reduce((a, b) => a + b, 0) / totals.length;
       }
-      const pregameTotal = pregameTotalsCache[scoreEvent.id] || null;
 
-      // Live totals: only show for in-progress games (these are live-adjusted lines)
+      // ESPN match
+      const espnGame = findEspnGame(espnLookup, scoreEvent.home_team, scoreEvent.away_team);
+
+      // Pregame total with error tracking
+      let pregameTotal = null;
+      let pregameError = null;
+      if (espnGame?.overUnder) {
+        pregameTotal = espnGame.overUnder;
+      } else if (pregameTotalsCache[scoreEvent.id]) {
+        pregameTotal = pregameTotalsCache[scoreEvent.id];
+      } else if (!espnAvailable) {
+        pregameError = espnStatus.error || 'ESPN unavailable';
+      } else if (!espnGame) {
+        pregameError = 'ESPN: no match';
+      } else {
+        pregameError = 'No odds data';
+      }
+
+      // Live totals
       const dkLiveTotal = isLive ? dkTotal : null;
       const fdLiveTotal = isLive ? fdTotal : null;
 
-      // ESPN clock data
-      const espnGame = findEspnGame(espn, scoreEvent.home_team, scoreEvent.away_team);
-
-      // Determine game status and time
+      // Game status and time with error tracking
       let timeRemaining = null;
       let period = null;
-      let gameStatus = 'scheduled'; // scheduled, live, halftime, final
+      let gameStatus = 'scheduled';
+      let timeError = null;
 
       if (scoreEvent.completed) {
         gameStatus = 'final';
         timeRemaining = '0:00';
         period = 2;
-      } else if (scoreEvent.scores && scoreEvent.scores.length > 0) {
+      } else if (isLive) {
         gameStatus = 'live';
-        if (espnGame) {
+        if (espnGame && espnGame.clock) {
           timeRemaining = espnGame.clock;
           period = espnGame.period;
           if (espnGame.statusType === 'STATUS_HALFTIME') {
@@ -259,6 +315,24 @@ app.get('/api/games', async (req, res) => {
           } else if (espnGame.statusType === 'STATUS_END_PERIOD' && espnGame.period === 1) {
             gameStatus = 'halftime';
           }
+        } else if (!espnAvailable) {
+          timeError = espnStatus.error || 'ESPN unavailable';
+        } else if (!espnGame) {
+          timeError = 'ESPN: no match for game';
+        } else {
+          timeError = 'ESPN: no clock data';
+        }
+      }
+
+      // Projection error tracking
+      let projError = null;
+      if (isLive) {
+        if (currentTotal === null) {
+          projError = 'No score data';
+        } else if (timeRemaining === null || period === null) {
+          projError = timeError || 'No clock data';
+        } else if (pregameTotal === null) {
+          projError = 'No pregame total (pace fallback)';
         }
       }
 
@@ -271,13 +345,22 @@ app.get('/api/games', async (req, res) => {
         awayScore: awayScore != null ? parseInt(awayScore) : null,
         currentTotal,
         pregameTotal,
+        pregameError,
         dkLiveTotal,
         fdLiveTotal,
         timeRemaining,
         period,
         gameStatus,
+        timeError,
+        projError,
+        espnMatched: !!espnGame,
       };
     });
+
+    // Log match results
+    const matched = games.filter(g => g.espnMatched).length;
+    const liveGames = games.filter(g => g.gameStatus === 'live' || g.gameStatus === 'halftime').length;
+    console.log(`Games: ${games.length} total, ${liveGames} live, ${matched} ESPN-matched, ${espnLookup.length} ESPN events`);
 
     res.json({
       games,
@@ -286,6 +369,7 @@ app.get('/api/games', async (req, res) => {
       apiQuotaRemaining,
       apiQuotaUsed,
       budgetExhausted,
+      espnStatus,
       lastUpdated: new Date().toISOString(),
     });
   } catch (err) {
@@ -298,39 +382,39 @@ app.get('/api/debug', async (req, res) => {
   const espn = await getCachedEspn();
   const scores = cache.scores.data;
 
-  const espnTeams = (espn?.events || []).map(e => {
-    const comp = e.competitions?.[0]?.competitors || [];
-    const home = comp.find(c => c.homeAway === 'home');
-    const away = comp.find(c => c.homeAway === 'away');
+  const espnLookup = buildEspnLookup(espn);
+
+  const espnTeams = espnLookup.map(e => ({
+    home: e.homeNames,
+    away: e.awayNames,
+    overUnder: e.overUnder,
+    status: e.statusType,
+    clock: e.clock,
+    period: e.period,
+  }));
+
+  const oddsApiTeams = (scores || []).map(s => {
+    const espnMatch = findEspnGame(espnLookup, s.home_team, s.away_team);
     return {
-      home: {
-        displayName: home?.team?.displayName,
-        shortDisplayName: home?.team?.shortDisplayName,
-        name: home?.team?.name,
-        abbreviation: home?.team?.abbreviation,
-      },
-      away: {
-        displayName: away?.team?.displayName,
-        shortDisplayName: away?.team?.shortDisplayName,
-        name: away?.team?.name,
-        abbreviation: away?.team?.abbreviation,
-      },
-      status: e.status?.type?.name,
-      clock: e.status?.displayClock,
-      period: e.status?.period,
+      id: s.id,
+      home: s.home_team,
+      away: s.away_team,
+      hasScores: !!(s.scores && s.scores.length > 0),
+      completed: s.completed,
+      espnMatched: !!espnMatch,
+      espnOverUnder: espnMatch?.overUnder || null,
+      espnClock: espnMatch?.clock || null,
+      espnPeriod: espnMatch?.period || null,
     };
   });
 
-  const oddsApiTeams = (scores || []).map(s => ({
-    id: s.id,
-    home: s.home_team,
-    away: s.away_team,
-    hasScores: !!(s.scores && s.scores.length > 0),
-    completed: s.completed,
-    espnMatch: findEspnGame(espn, s.home_team, s.away_team) ? 'MATCHED' : 'NO MATCH',
-  }));
-
-  res.json({ espnTeams, oddsApiTeams, pregameTotalsCache });
+  res.json({
+    espnEventCount: espn?.events?.length || 0,
+    espnStatus,
+    espnTeams,
+    oddsApiTeams,
+    pregameTotalsCache,
+  });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
