@@ -1,0 +1,12 @@
+{
+  "name": "cbb-in-game-totals",
+  "version": "1.0.0",
+  "description": "College basketball in-game projected totals calculator",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
